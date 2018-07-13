@@ -30,6 +30,7 @@
 #define _FILE_OFFSET_BITS 64
 
 #define _CRT_RAND_S
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <TlHelp32.h>
 #include <stdarg.h>
@@ -60,6 +61,15 @@
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
+
+// IntelPT includes
+#define INTELPT
+#ifdef INTELPT
+#define MEM_LIMIT_INTELPT   200
+#include "../ptcov/ptcov.h"
+#pragma comment (lib, "ptcov.lib")
+PtCovCtx ptcov = NULL;
+#endif
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
@@ -106,6 +116,10 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            skip_requested,            /* Skip request, via SIGUSR1        */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
+#ifdef INTELPT
+           intelpt_mode,              /* Running in Intel PT mode?        */
+           kernel_mode;               /* Tracing kernel mode?             */
+#endif
            drioless = 0;              /* Running without DRIO?            */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -2173,7 +2187,11 @@ char *argv_to_cmd(char** argv) {
   return ret;
 }
 
+#ifdef INTELPT
+static void create_target_process_dynamo(char** argv) {
+#else
 static void create_target_process(char** argv) {
+#endif
   char *cmd;
   char *pipe_name;
   char *buf;
@@ -2314,8 +2332,86 @@ static void create_target_process(char** argv) {
   ck_free(pipe_name);
 }
 
+#ifdef INTELPT
+static void create_target_process_intelpt(char** argv) {
+  char* dr_cmd;
+  char* pipe_name;
+  char *buf;
+  char *pidfile;
+  FILE *fp;
+  size_t pidsize;
+  BOOL inherit_handles = TRUE;
 
+  STARTUPINFO si;
+  PROCESS_INFORMATION pi;
+
+  printf("create_target_process_intelpt\n");
+
+  if (persistent_mode)
+  {
+    printf("create_target_process_intelpt PERSISTENT\n");
+
+    //pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
+    pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_default");
+    pipe_handle = CreateNamedPipe(
+      pipe_name,                // pipe name
+      PIPE_ACCESS_DUPLEX,       // read/write access
+      0,
+      1,                        // max. instances
+      512,                      // output buffer size
+      512,                      // input buffer size
+      20000,                    // client time-out
+      NULL);                    // default security attribute
+
+    if (pipe_handle == INVALID_HANDLE_VALUE)
+    {
+      FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+    }
+    SetEnvironmentVariableA("AFL_PIPE_NAME", pipe_name);
+    ck_free(pipe_name);
+  }
+  target_cmd = argv_to_cmd(argv);
+
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  ZeroMemory(&pi, sizeof(pi));
+
+  sinkhole_stds = 0;
+  if (sinkhole_stds) {
+    si.hStdOutput = si.hStdError = devnul_handle;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+  }
+  else {
+    inherit_handles = FALSE;
+  }
+
+  if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
+    FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
+  }
+  child_handle = pi.hProcess;
+  child_thread_handle = pi.hThread;
+  child_pid = pi.dwProcessId;
+
+  if (persistent_mode)
+  {
+    watchdog_timeout_time = get_cur_time() + exec_tmout;
+    watchdog_enabled = 1;
+
+    if (!ConnectNamedPipe(pipe_handle, NULL)) {
+      if (GetLastError() != ERROR_PIPE_CONNECTED) {
+        FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
+      }
+    }
+    watchdog_enabled = 0;
+  }
+
+  ck_free(target_cmd);
+}
+
+static void destroy_target_process_dynamo(int wait_exit) {
+#else
 static void destroy_target_process(int wait_exit) {
+#endif
 	char* kill_cmd;
 	BOOL still_alive = TRUE;
 	STARTUPINFO si;
@@ -2395,13 +2491,103 @@ leave:
 	LeaveCriticalSection(&critical_section);
 }
 
+
+#ifdef INTELPT
+BOOL SafeTerminateProcess(HANDLE hProcess, unsigned int uExitCode, unsigned int timeout)
+{
+  DWORD dwTID, dwCode, dwErr = 0;
+  HANDLE hProcessDup = INVALID_HANDLE_VALUE;
+  HANDLE hRT = NULL;
+  HINSTANCE hKernel = GetModuleHandleA("kernel32");
+
+  BOOL bSuccess = FALSE;
+  BOOL bDup = DuplicateHandle(GetCurrentProcess(),
+              hProcess,
+              GetCurrentProcess(),
+              &hProcessDup,
+              PROCESS_ALL_ACCESS,
+              FALSE,
+              0);
+
+  if (GetExitCodeProcess((bDup) ? hProcessDup : hProcess, &dwCode)
+    && (dwCode == STILL_ACTIVE))
+  {
+    FARPROC pfnExitProc;
+    pfnExitProc = GetProcAddress(hKernel, "ExitProcess");
+    hRT = CreateRemoteThread((bDup) ? hProcessDup : hProcess,
+            NULL,
+            0,
+            (LPTHREAD_START_ROUTINE)pfnExitProc,
+            (PVOID)uExitCode, 0, &dwTID);
+    if (hRT == NULL) dwErr = GetLastError();
+  }
+  else
+  {
+    dwErr = ERROR_PROCESS_ABORTED;
+  }
+  if (hRT)
+  {
+    WaitForSingleObject((bDup) ? hProcessDup : hProcess, timeout);
+    CloseHandle(hRT);
+    bSuccess = TRUE;
+  }
+  if (bDup)
+    CloseHandle(hProcessDup);
+  if (!bSuccess)
+    SetLastError(dwErr);
+
+  return bSuccess;
+}
+
+static void destroy_target_process_intelpt(int wait_exit) {
+  char* kill_cmd;
+  STARTUPINFO si;
+  PROCESS_INFORMATION pi;
+
+  EnterCriticalSection(&critical_section);
+
+  if (child_handle) {
+    if (!SafeTerminateProcess(child_handle, 0, wait_exit))
+	{
+	  TerminateProcess(child_handle, 0);
+	}
+    //wait until the child process exits
+    if (WaitForSingleObject(child_handle, wait_exit) == WAIT_TIMEOUT) {
+      FATAL("Cannot kill child process\n");
+    }
+
+    CloseHandle(child_handle);
+    CloseHandle(child_thread_handle);
+
+    child_handle = NULL;
+  }
+
+  //close the pipe
+  if (pipe_handle) {
+    DisconnectNamedPipe(pipe_handle);
+    CloseHandle(pipe_handle);
+
+    pipe_handle = NULL;
+  }
+
+  LeaveCriticalSection(&critical_section);
+}
+#endif
+
 DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
 	u64 current_time;
 	while(1) {
 		Sleep(1000);
 		current_time = get_cur_time();
 		if(watchdog_enabled && (current_time > watchdog_timeout_time)) {
-			destroy_target_process(0);
+#ifdef INTELPT
+      if(intelpt_mode)
+        destroy_target_process_intelpt(0);
+      else
+        destroy_target_process_dynamo(0);
+#else
+      destroy_target_process(0);
+#endif
 		}
 	}
 }
@@ -2424,8 +2610,27 @@ static int is_child_running() {
 
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
-
+#ifdef INTELPT
 static u8 run_target(char** argv, u32 timeout) {
+  if (intelpt_mode)
+  {
+    if(persistent_mode)
+      return run_target_intelpt_persistent(argv);
+    else if (kernel_mode)
+      return run_target_intelpt_kernel(argv);
+    else
+      return run_target_intelpt(argv);
+  }
+  else
+  {
+    return run_target_dynamo(argv, timeout);
+  }
+}
+
+static u8 run_target_dynamo(char** argv, u32 timeout) {
+#else
+static u8 run_target(char** argv, u32 timeout) {
+#endif
   //todo watchdog timer to detect hangs
 
   char command[] = "F";
@@ -2448,8 +2653,13 @@ static u8 run_target(char** argv, u32 timeout) {
   }
 
   if(!is_child_running()) {
+#ifdef INTELPT
+    destroy_target_process_dynamo(0);
+    create_target_process_dynamo(argv);
+#else
     destroy_target_process(0);
     create_target_process(argv);
+#endif
     fuzz_iterations_current = 0;
   }
 
@@ -2483,19 +2693,140 @@ static u8 run_target(char** argv, u32 timeout) {
   fuzz_iterations_current++;
 
   if(fuzz_iterations_current == fuzz_iterations_max) {
+#ifdef INTELPT
+    destroy_target_process_dynamo(2000);
+#else
 	  destroy_target_process(2000);
+#endif
   }
 
   if (result == 'K') return FAULT_NONE;
 
   if (result == 'C') {
+#ifdef INTELPT
+    destroy_target_process_dynamo(2000);
+#else
 	  destroy_target_process(2000);
-	  return FAULT_CRASH;
+#endif
+    return FAULT_CRASH;
   }
 
-  destroy_target_process(0);
+#ifdef INTELPT
+    destroy_target_process_dynamo(2000);
+#else
+	  destroy_target_process(0);
+#endif
   return FAULT_TMOUT;
 }
+
+#ifdef INTELPT
+static u8 run_target_intelpt_persistent(char** argv) {
+  char command[] = "F";
+  DWORD num_read;
+  char result = 0;
+
+  //printf("run_target_intelpt_persistent\n");
+
+  sinkhole_stds = 0;
+  if (sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
+    devnul_handle = CreateFile(
+      "nul",
+      GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      NULL,
+      OPEN_EXISTING,
+      0,
+      NULL);
+
+    if (devnul_handle == INVALID_HANDLE_VALUE) {
+      PFATAL("Unable to open the nul device.");
+    }
+  }
+
+  if (!is_child_running()) {
+    destroy_target_process_intelpt(0);
+    create_target_process_intelpt(argv);
+    fuzz_iterations_current = 0;
+  }
+
+  child_timed_out = 0;
+  memset(trace_bits, 0, MAP_SIZE);
+
+  PtTraceProcessStart(child_handle);
+
+  WriteFile(
+    pipe_handle,    // handle to pipe
+    command,        // buffer to write from
+    1,              // number of bytes to write
+    &num_read,      // number of bytes written
+    NULL);          // not overlapped I/O
+
+  watchdog_timeout_time = get_cur_time() + exec_tmout;
+  watchdog_enabled = 1;
+
+  ReadFile(pipe_handle, &result, 1, &num_read, NULL);
+
+  watchdog_enabled = 0;
+
+  PtTraceProcessStop(child_handle);
+  //process_pt_ext();
+
+  total_execs++;
+  fuzz_iterations_current++;
+
+  //Sleep(1); // XXX this is hacky
+  if (fuzz_iterations_current == fuzz_iterations_max) {
+    destroy_target_process_intelpt(2000);
+    fuzz_iterations_current = 0;
+  }
+
+  //printf("total_execs: %lld\n", total_execs);
+
+  if (result == 'K') return FAULT_NONE;
+
+  if (result == 'C') {
+    destroy_target_process_intelpt(2000);
+    return FAULT_CRASH;
+  }
+
+  destroy_target_process_intelpt(0);
+  return FAULT_TMOUT;
+}
+
+static u8 run_target_intelpt(char** argv) {
+  char *cmdLine = argv_to_cmd(argv);
+  unsigned int cmdLen = (strlen(cmdLine) + 1) * sizeof(wchar_t);
+  wchar_t *cmdLineW = malloc(cmdLen);
+  mbstowcs(cmdLineW, cmdLine, cmdLen);
+
+  printf("run_target_intelpt\n");
+
+  memset(trace_bits, 0, MAP_SIZE);
+  PtTraceCmdLine(cmdLineW);
+  ptcov_get_afl_map(ptcov, trace_bits);
+  total_execs++;
+
+  free(cmdLineW);
+  return FAULT_NONE;
+}
+
+static u8 run_target_intelpt_kernel(char** argv) {
+  char *cmdLine = argv_to_cmd(argv);
+  unsigned int cmdLen = (strlen(cmdLine) + 1) * sizeof(wchar_t);
+  wchar_t *cmdLineW = malloc(cmdLen);
+  mbstowcs(cmdLineW, cmdLine, cmdLen);
+
+  fprintf(stderr, "run_target_intelpt_kernel\n");
+
+  memset(trace_bits, 0, MAP_SIZE);
+  PtTraceCmdLineKernel(cmdLineW);
+  ptcov_get_afl_map(ptcov, trace_bits);
+  total_execs++;
+  free(cmdLineW);
+  return FAULT_NONE;
+}
+#endif
+
 
 
 /* Write modified data to file for testing. If out_file is set, the old file
@@ -2513,7 +2844,14 @@ static void write_to_testcase(void* mem, u32 len) {
     fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
 
     if (fd < 0) {
+#ifdef INTELPT
+      if(intelpt_mode)
+        destroy_target_process_intelpt(0);
+      else
+        destroy_target_process_dynamo(0);
+#else
       destroy_target_process(0);
+#endif
       
 	  unlink(out_file); /* Ignore errors. */
 
@@ -2551,7 +2889,14 @@ static void write_with_gap(char* mem, u32 len, u32 skip_at, u32 skip_len) {
     fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
 
     if (fd < 0) {
+#ifdef INTELPT
+      if(intelpt_mode)
+        destroy_target_process_intelpt(0);
+      else
+        destroy_target_process_dynamo(0);
+#else
       destroy_target_process(0);
+#endif
 
 	  unlink(out_file); /* Ignore errors. */
 
@@ -2631,7 +2976,11 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
+#ifndef INTELPT
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
+#else
+    if (!dumb_mode && !intelpt_mode && !stage_cur && !count_bytes(trace_bits)) {
+#endif
       fault = FAULT_NOINST;
       goto abort_calibration;
     }
@@ -6849,6 +7198,10 @@ static void usage(u8* argv0) {
        "  -i dir        - input directory with test cases\n"
        "  -o dir        - output directory for fuzzer findings\n"
        "  -t msec       - timeout for each run\n\n"
+#ifdef INTELPT
+       "  -P            - trace with intelpt\n"
+       "  -PP           - persistent trace with intelpt\n"
+#endif
 
        "Instrumentation type:\n\n"
         "  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
@@ -7405,6 +7758,14 @@ static void extract_client_params(u32 argc, char** argv) {
   for (i = opt_start; i < opt_end; i++) {
     if((strcmp(argv[i], "-fuzz_iterations") == 0) && ((i + 1) < opt_end)) {
       fuzz_iterations_max = atoi(argv[i+1]);
+#ifdef INTELPT
+      if(intelpt_mode && persistent_mode)
+      {
+        char cnt[32];
+        itoa(fuzz_iterations_max, cnt, 10);
+        SetEnvironmentVariableA("AFL_PERSISTENT_ITERATIONS", cnt);
+      }
+#endif
     }
   }
 
@@ -7493,7 +7854,11 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
+#ifdef INTELPT
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QPKD:b:")) > 0)
+#else
   while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:")) > 0)
+#endif
 
     switch (opt) {
 
@@ -7663,6 +8028,27 @@ int main(int argc, char** argv) {
 
         break;
 
+#ifdef INTELPT
+      case 'P':
+
+        // -PP == intelpt w/ persistent mode
+        if (intelpt_mode)
+        {
+          persistent_mode++;
+		  SetEnvironmentVariableA("PTCOV_AVRF", "1");
+        }
+
+        // trace is controlled from this process, so simply malloc
+        if (!mem_limit_given) mem_limit = MEM_LIMIT_INTELPT;
+        if (!trace_bits) trace_bits = calloc(1, MAP_SIZE);
+
+        intelpt_mode++;
+        break;
+	  case 'K':
+		  kernel_mode = 1;
+		  break;
+#endif 
+
       case 'Y':
 
         if (dynamorio_dir) FATAL("Dynamic-instrumentation via DRIO is uncompatible with static-instrumentation");
@@ -7676,7 +8062,11 @@ int main(int argc, char** argv) {
 
     }
 
+#ifdef INTELPT
+  if (!in_dir || !out_dir || !timeout_given || (!drioless && !dynamorio_dir && !intelpt_mode)) usage(argv[0]);
+#else
   if (!in_dir || !out_dir || !timeout_given || (!drioless && !dynamorio_dir)) usage(argv[0]);
+#endif
 
   extract_client_params(argc, argv);
   optind++;
@@ -7693,8 +8083,36 @@ int main(int argc, char** argv) {
 
     if (crash_mode) FATAL("-C and -n are mutually exclusive");
     if (qemu_mode)  FATAL("-Q and -n are mutually exclusive");
+#ifdef INTELPT
+    if (intelpt_mode) FATAL("-P and -n are mutually exclusive");
+#endif
 
   }
+
+#ifdef INTELPT
+  if (intelpt_mode == 3)
+  {
+    if (!InitPtTrace(&trace_bits))
+      FATAL("ERROR: could not initialize ptcov library\n");
+  }
+  else if (intelpt_mode > 0)
+  {
+    if (!ptcov_init())
+      FATAL("ERROR: could not initialize ptcov library (check driver install)\n");
+
+    PtCovConfig ptcov_options;
+    memset(&ptcov_options, 0, sizeof(PtCovConfig));
+    ptcov_options.cpu_number = 0;
+    ptcov_options.trace_buffer_size = 64 * 1024 * 1024;
+    ptcov_options.trace_mode = MODULE;
+    ptcov_options.cov_map = &trace_bits;
+    ptcov_options.cov_map_size = MAP_SIZE;
+    ptcov_options.ptdump_path = "ptdump.bin";
+
+    if (!ptcov_init_trace(&ptcov_options, &ptcov))
+      FATAL("ERROR: could not initialize ptcov trace\n");
+  }
+#endif
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
   if (getenv("AFL_NO_CPU_RED"))    no_cpu_meter_red = 1;
